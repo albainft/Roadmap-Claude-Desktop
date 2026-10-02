@@ -1,4 +1,4 @@
-# Feuille de route
+# Roadmap
 
 Une feuille de route écrite en Markdown, affichée comme une liste de tâches interactive : thèmes, tâches ouvertes puis faites, statut et environnement de chaque tâche, recherche, filtres, tri, détail et historique tirés du journal.
 
