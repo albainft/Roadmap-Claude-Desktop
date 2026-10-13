@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Génère ROADMAP.html et ROADMAP.artifact.html depuis ROADMAP.md : thèmes, tâches avec statut et environnement, filtres, tri, journal.
 
-Usage : python3 gen_roadmap_html.py [ROADMAP.md [sortie.html]] [--launch="/commande {id}"]
+Usage : python3 gen_roadmap_html.py [ROADMAP.md [sortie.html]] [--notes=DOSSIER] [--notes-url=URL/] [--launch="/commande {id}"]
 Écrit la page complète et, à côté, ROADMAP.artifact.html (contenu seul, pour un artefact Claude Desktop). Avec --launch,
 chaque tâche ouverte reçoit un bouton « Lancer » qui envoie la commande (l'artefact doit déclarer la capacité `comments`).
-Statuts et environnements sont déduits du texte des tâches ; rien n'est écrit dans le Markdown."""
+Notes : si un dossier notes/ existe à côté de ROADMAP.md (ou --notes), chaque tâche prend son titre, son statut, ses environnements,
+son TL;DR, sa prochaine étape et son historique dans sa note (roadmap_notes.py), et le journal est reconstitué depuis les historiques ;
+--notes-url=URL/ ajoute un bouton « Ouvrir » vers URL/<ID>.md. Sans note, statuts et environnements sont déduits du texte des tâches.
+Balises : des [mots] en tête de ligne d'une tâche deviennent des pastilles (« [✓plan] » en vert, « [plan:⏳] » en gris).
+Rien n'est écrit dans le Markdown."""
 import html
 import os
 import json
@@ -12,11 +16,21 @@ import pathlib
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import roadmap_notes as rn
+
 ARGS = [x for x in sys.argv[1:] if not x.startswith("--")]
 LAUNCH = next((x.split("=", 1)[1] for x in sys.argv[1:] if x.startswith("--launch=")), None)
+NOTES_DIR = next((x.split("=", 1)[1] for x in sys.argv[1:] if x.startswith("--notes=")), None)
+NOTES_URL = next((x.split("=", 1)[1] for x in sys.argv[1:] if x.startswith("--notes-url=")), "")
 SRC = pathlib.Path(ARGS[0] if ARGS else "ROADMAP.md")
 OUT = pathlib.Path(ARGS[1] if len(ARGS) > 1 else str(SRC.with_suffix(".html")))
 FIELDS = ("Statut", "Objectif", "Fait", "Briques existantes", "Prochaine action", "Bloqueur")
+NOTES = {}
+_nd = pathlib.Path(NOTES_DIR) if NOTES_DIR else SRC.parent / "notes"
+if _nd.is_dir():
+    rn.NOTES = _nd
+    NOTES = rn.load_notes()
 
 ENVS = [
     ("secu", "Sécurité", r"sécurité|secret|mot de passe|authentification|chiffrement|droits|permission"),
@@ -120,18 +134,62 @@ def table(rows):
     return f"<table><thead><tr>{h}</tr></thead><tbody>{b}</tbody></table>"
 
 
+def note_code(fm, done, first):
+    code = "fait" if done else str(fm.get("statut") or "todo")
+    if code not in STATUS:
+        code = "todo"
+    if not done and first:
+        return "decision" if code == "decision" else "next"
+    if not done and code == "next":
+        return "todo"
+    return code
+
+
+TICK = "✓"
+BALISES_TETE = re.compile(r"^((?:\[[^\]\n]+\](?!\()\s*)+)")
+
+
+def balises_html(text):
+    m = BALISES_TETE.match(text)
+    if not m:
+        return text, ""
+    puces = []
+    for p in re.findall(r"\[([^\]]+)\]", m.group(1)):
+        if p.startswith(TICK) or p.endswith(":" + TICK):
+            puces.append(f'<span class="pill ok">{TICK} {html.escape(p.strip(TICK + ":"))}</span>')
+        elif p.endswith(":⏳"):
+            puces.append(f'<span class="pill lt">… {html.escape(p[:-2])}</span>')
+        else:
+            puces.append(f'<span class="pill pl">{html.escape(p)}</span>')
+    return text[m.end():], "".join(puces)
+
+
 def task_html(tid, text, done, first, th=0):
-    title, rest = split_title(text)
-    code, extra = status_of(tid, text, done, first)
-    ev = envs_of(text)
-    main_env = ev[0] if ev else "ops"
-    cls = f"task b-{main_env}" + (" done" if done else "") + (" next" if code in ("next", "decision") else "")
-    hist = [j for j in journal if re.match(r"\d{4}-\d\d-\d\d : " + re.escape(tid) + r"\b", j)]
+    text, bal = balises_html(text)
+    note = NOTES.get(tid)
+    if note:
+        fm = note["fm"]
+        title, rest = fm.get("titre") or split_title(text)[0], fm.get("tldr") or ""
+        ev = [e for e in (fm.get("env") or []) if e in ENV_NAMES][:3] or ["ops"]
+        code, extra = note_code(fm, done, first), ""
+        hist = [h[2:] for h in rn.history_lines(note["body"])]
+        step = "" if done else (fm.get("prochaine") or "")
+        date = f"fait le {fm.get('fait')}" if done and fm.get("fait") else (f"mis à jour le {fm.get('maj')}" if fm.get("maj") else "")
+        link = (f'<a class="open" href="{html.escape(NOTES_URL + tid + ".md")}" target="_blank" rel="noopener noreferrer">Ouvrir la note</a>' if NOTES_URL else "")
+    else:
+        title, rest = split_title(text)
+        code, extra = status_of(tid, text, done, first)
+        ev = envs_of(text) or ["ops"]
+        hist = [j for j in journal if re.match(r"\d{4}-\d\d-\d\d : " + re.escape(tid) + r"\b", j)]
+        step, date, link = "", "", ""
+    cls = f"task b-{ev[0]}" + (" done" if done else "") + (" next" if code in ("next", "decision") else "")
+    meta = ""
+    if step or date or link:
+        meta = "<p class='meta'>" + (f"<b>Prochaine étape</b> : {inline(step)} " if step else "") + (f"&middot; <span class='small'>{html.escape(date)}</span> " if date else "") + link + "</p>"
     hist_html = ("<p class='lbl'>Historique (" + str(len(hist)) + ")</p><ul class='hist'>" + "".join(f"<li>{inline(j)}</li>" for j in hist) + "</ul>") if hist else ""
-    uh = ""
-    det = f"<details><summary>Détail</summary><p>{inline(rest)}</p>{uh}{hist_html}</details>" if (rest or hist or uh) else ""
+    det = f"<details><summary>Détail</summary><p>{inline(rest)}</p>{meta}{hist_html}</details>" if (rest or hist or meta) else ""
     return (f'<article class="{cls}" data-id="{html.escape(tid)}" data-st="{code}" data-env="{" ".join(ev)}" data-th="{th}"><div class="row"><span class="id">{html.escape(tid)}</span><span class="ttl">{inline(title)}</span>'
-            f'<span class="tags">{env_chips(ev)}{pill(code, extra)}</span></div>{det}</article>')
+            f'<span class="tags">{bal}{env_chips(ev)}{pill(code, extra)}</span></div>{det}</article>')
 
 
 lines = SRC.read_text(encoding="utf-8").split("\n")
@@ -167,6 +225,9 @@ for line in lines:
     elif section.startswith("Journal") and line.startswith("- "):
         journal.append(line[2:])
 
+if NOTES:
+    journal = [e["text"] for e in rn.entries()]
+
 suivi_html, buf = [], []
 for l in suivi + [""]:
     if l.startswith("|"):
@@ -182,7 +243,7 @@ counts = {k: 0 for k in STATUS}
 for t in themes:
     seen = False
     for tid, text, done in t["tasks"]:
-        code, _ = status_of(tid, text, done, not seen and not done)
+        code = note_code(NOTES[tid]["fm"], done, not seen and not done) if tid in NOTES else status_of(tid, text, done, not seen and not done)[0]
         counts[code] += 1
         seen = seen or not done
 open_total = sum(1 for t in themes for x in t["tasks"] if not x[2])
@@ -217,7 +278,17 @@ for i, t in enumerate(themes, 1):
     body += f'<section id="t{i}"><h2>{inline(t["title"])}</h2><dl>{dl}</dl><div class="tasks">{tasks}</div></section>'
 
 verif_html = "".join(task_html(a, b, c, False) for a, b, c in verif)
-parque_html = "".join(f"<li>{inline(p)}</li>" for p in parque)
+def parque_item(p):
+    m = re.match(r"(P\d+) (.*)", p)
+    n = NOTES.get("parque/" + m.group(1)) if m else None
+    if not n:
+        return f"<li>{inline(p)}</li>"
+    fm = n["fm"]
+    more = (f" {inline(fm['tldr'])}" if fm.get("tldr") else "") + (f" <span class='small'>Pour reprendre : {inline(fm['prochaine'])}</span>" if fm.get("prochaine") else "")
+    return f"<li><b>{html.escape(m.group(1))}</b> {inline(fm.get('titre') or m.group(2))}.{more}</li>"
+
+
+parque_html = "".join(parque_item(p) for p in parque)
 j_vis = "".join(f"<li>{inline(j)}</li>" for j in journal[:8])
 j_rest = "".join(f"<li>{inline(j)}</li>" for j in journal[8:])
 
@@ -251,13 +322,14 @@ details{margin-top:6px}summary{cursor:pointer;color:var(--acc);font-size:13px}de
 code{font:12.5px ui-monospace,monospace;background:var(--accbg);color:var(--fg);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}a{color:var(--acc)}
 table{border-collapse:collapse;width:100%;font-size:13.5px;margin:10px 0 18px}th,td{border-bottom:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}th{color:var(--mut);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
 ul{padding-left:18px}li{margin:6px 0;font-size:14px;overflow-wrap:anywhere}.note{color:var(--mut);font-size:13px}
+.open{font-size:12px;text-decoration:none;border:1px solid var(--line);border-radius:6px;padding:1px 8px;color:var(--acc)}.meta{font-size:13px;color:var(--mut)}
 .pill.ec{background:var(--accbg);color:var(--acc);border:1px solid var(--acc)}.hist{margin:4px 0 8px;padding-left:18px}.hist li{font-size:13px;color:var(--mut)}.doneblock{margin-top:12px}.doneblock>summary{font-size:14px;color:var(--mut)}
 """ + env_css)
 
 budget_line = ""
 
 doc = f"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><style>{css}</style></head><body><main>
-<h1>{html.escape(title)}</h1><div class="sub">{html.escape(updated)} Généré depuis ROADMAP.md : ne pas éditer ce fichier.{budget_line}</div>
+<h1>{html.escape(title)}</h1><div class="sub">{html.escape(updated)} Généré depuis {SRC.name}{" et notes/" if NOTES else ""} : ne pas éditer ce fichier.{budget_line}</div>
 <nav><a href="#themes">Thèmes</a><a href="#verif">Vérifications</a><a href="#parque">Parqué</a><a href="#journal">Journal</a></nav>
 <div class="legend"><div><b>Statuts</b>{legend_st}</div><div><b>Environnements</b>{legend_env}</div></div>
 <section id="themes"><h2>Thèmes actifs ({len(themes)}) et {open_total} tâches ouvertes</h2><div class="stats">{stats}</div><div class="cards">{cards}</div></section>
